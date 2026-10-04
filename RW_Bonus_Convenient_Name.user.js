@@ -1,9 +1,9 @@
 // ==UserScript==
-// @name         RW Bonus Convenient Name
-// @namespace    https://github.com/RyuFive/TornScripts
-// @version      8.1.3
-// @description  Displays RW bonus values with convenient names across Torn pages.
-// @author       RyuFive
+// @name         RW Bonus Convenient Name (with RW Bonus % Sort)
+// @namespace    https://github.com/gl1tchh/TornScripts
+// @version      8.2.0
+// @description  Displays RW bonus values with convenient names across Torn pages. Adds RW bonus sorting to the Item Market.
+// @author       RyuFive & gl1tch
 // @match        https://www.torn.com/displaycase.php*
 // @match        https://www.torn.com/amarket.php*
 // @match        https://www.torn.com/bazaar.php*
@@ -11,8 +11,6 @@
 // @match        https://www.torn.com/item.php*
 // @match        https://www.torn.com/page.php?sid=ItemMarket*
 // @icon         https://www.google.com/s2/favicons?sz=64&domain=torn.com
-// @downloadURL  https://github.com/RyuFive/TornScripts/raw/main/RW_Bonus_Convenient_Name.user.js
-// @updateURL    https://github.com/RyuFive/TornScripts/raw/main/RW_Bonus_Convenient_Name.user.js
 // @license      MIT
 // ==/UserScript==
 
@@ -38,6 +36,10 @@
 		.custom-armory-bonus-badge:first-child:last-child { top: 0 !important; bottom: 0 !important; }
 		.double .custom-armory-bonus-badge:first-child { top: 0 !important; bottom: 50% !important; }
 		.double .custom-armory-bonus-badge:last-child { top: 50% !important; bottom: 0 !important; }
+		.rw-sort-bar { display: flex; align-items: center; gap: 8px; flex-wrap: wrap; padding: 6px 10px; margin: 6px 0; border-radius: 6px; font-size: 12px; background: rgba(0,0,0,0.06); color: #333; }
+		body.dark-mode .rw-sort-bar { background: rgba(255,255,255,0.06); color: #ddd; }
+		.rw-sort-bar select { font-size: 12px; padding: 3px 6px; border-radius: 4px; border: 1px solid rgba(0,0,0,0.3); background: #fff; color: #000; max-width: 100%; }
+		body.dark-mode .rw-sort-bar select { background: #2b2b2b; color: #ddd; border-color: #555; }
 	`
     const style = document.createElement("style")
     style.textContent = css
@@ -197,6 +199,45 @@ function getWeaponBonus(bonusName, numericValue) {
         if (numericValue >= special.min && numericValue <= special.max) return { color: "orange", range: special }
     }
     return null
+}
+
+// SORT HELPERS: tier + range lookup used to score "roll quality" ================================================
+
+const TIER_RANK = { yellow: 0, orange: 1, red: 2 }
+
+function getBonusRange(numericValue, bonusName, itemName) {
+    const name = String(bonusName || "").trim().toLowerCase()
+    const slot = getItemSlot(itemName)
+    const armor = Object.values(armorBonuses).find(b => b?.name?.trim().toLowerCase() === name && b?.slots?.includes(slot))
+    if (armor) return { color: armor.color, min: armor.min, max: armor.max }
+    const weapon = getWeaponBonus(name, numericValue)
+    if (weapon?.color && weapon?.range) return { color: weapon.color, min: weapon.range.min, max: weapon.range.max }
+    return null
+}
+
+// Returns tierRank + position within that tier's range (0..1), e.g. a mid-roll orange = 1.5, a max red = 3.0
+function getRollQuality(numericValue, bonusName, itemName) {
+    if (!Number.isFinite(numericValue)) return NaN
+    const range = getBonusRange(numericValue, bonusName, itemName)
+    if (!range) return NaN
+    const span = range.max - range.min
+    const fraction = span > 0 ? Math.min(Math.max((numericValue - range.min) / span, 0), 1) : 1
+    return (TIER_RANK[range.color] ?? 0) + fraction
+}
+
+// Stores the best bonus value / quality on the tile so the sorter can read it later
+function recordItemMarketBonuses(tile, bonuses, itemName) {
+    const values = []
+    const qualities = []
+    bonuses.forEach(({ value, name }) => {
+        const num = parseFloat(String(value))
+        if (!Number.isFinite(num)) return
+        values.push(num)
+        const quality = getRollQuality(num, name, itemName)
+        if (Number.isFinite(quality)) qualities.push(quality)
+    })
+    if (values.length) tile.dataset.rwValue = String(Math.max(...values))
+    if (qualities.length) tile.dataset.rwQuality = String(Math.max(...qualities))
 }
 
 function createBonusBadge(value, bonus_name, item_name) {
@@ -588,6 +629,9 @@ function newItemMarket(triggered) {
     if (!triggered?.[0]) return
     if (!document.URL.includes("ItemMarket")) return
 
+    // Any new tile (bonus or not) should trigger a re-sort once this batch of tiles is processed
+    scheduleItemMarketSort()
+
     const tile = triggered[0]
 
     if (tile.getAttribute("data-badge-added") === "true") return
@@ -608,9 +652,12 @@ function newItemMarket(triggered) {
 
     appendNode.querySelectorAll(".custom-bonus-badge").forEach((el) => el.remove())
 
+    const sortBonuses = []
+
     const name1 = primary.getAttribute("data-bonus-attachment-title")
     const desc1 = primary.getAttribute("data-bonus-attachment-description")
     const value1 = formatNew(desc1, name1)
+    sortBonuses.push({ value: value1, name: name1 })
 
     const badge1 = createBonusBadge(value1, name1, item_name)
     appendNode.appendChild(badge1)
@@ -639,6 +686,7 @@ function newItemMarket(triggered) {
         const name2 = secondary.getAttribute("data-bonus-attachment-title")
         const desc2 = secondary.getAttribute("data-bonus-attachment-description")
         const value2 = formatNew(desc2, name2)
+        sortBonuses.push({ value: value2, name: name2 })
 
         const badge2 = createBonusBadge(value2, name2, item_name)
         appendNode.appendChild(badge2)
@@ -660,7 +708,124 @@ function newItemMarket(triggered) {
         badge2.style.width = `${badge2.clientWidth + 10}px`
     }
 
+    recordItemMarketBonuses(tile, sortBonuses, item_name)
     tile.setAttribute("data-badge-added", "true")
+}
+
+// ITEM MARKET SORTING ========================================================================================================
+// Reorders listings visually with CSS `order` instead of moving DOM nodes, so Torn's React list isn't disturbed.
+
+const TILE_SELECTOR = "[class*='itemTile___']"
+const RW_SORT_STORAGE_KEY = "rwBonusSortMode"
+const RW_SORT_MODES = [
+    { id: "off", label: "Default order" },
+    { id: "value-desc", label: "Bonus %: high → low" },
+    { id: "value-asc", label: "Bonus %: low → high" },
+    { id: "quality-desc", label: "Roll quality: best first" },
+    { id: "quality-asc", label: "Roll quality: worst first" },
+]
+
+let rwSortMode = (() => {
+    try { return localStorage.getItem(RW_SORT_STORAGE_KEY) || "off" } catch (e) { return "off" }
+})()
+if (!RW_SORT_MODES.some((m) => m.id === rwSortMode)) rwSortMode = "off"
+
+let rwSortTimer = null
+
+const getSortCell = (tile) => tile.closest("li") || tile
+const getTileFromCell = (cell) => (cell.matches(TILE_SELECTOR) ? cell : cell.querySelector(TILE_SELECTOR))
+
+function getItemMarketList() {
+    const tile = document.querySelector(TILE_SELECTOR)
+    return tile ? getSortCell(tile).parentElement : null
+}
+
+function ensureSortBar(list) {
+    const existing = document.getElementById("rw-sort-bar")
+    if (existing && existing.nextElementSibling === list) return
+    if (existing) existing.remove()
+    if (!list.parentElement) return
+
+    const bar = document.createElement("div")
+    bar.id = "rw-sort-bar"
+    bar.className = "rw-sort-bar"
+
+    const label = document.createElement("label")
+    label.textContent = "Sort by RW bonus:"
+    label.htmlFor = "rw-sort-select"
+
+    const select = document.createElement("select")
+    select.id = "rw-sort-select"
+    RW_SORT_MODES.forEach(({ id, label }) => {
+        const option = document.createElement("option")
+        option.value = id
+        option.textContent = label
+        select.appendChild(option)
+    })
+    select.value = rwSortMode
+    select.addEventListener("change", () => {
+        rwSortMode = select.value
+        try { localStorage.setItem(RW_SORT_STORAGE_KEY, rwSortMode) } catch (e) {}
+        applyItemMarketSort()
+    })
+
+    bar.append(label, select)
+    list.parentElement.insertBefore(bar, list)
+}
+
+function applyItemMarketSort() {
+    if (!document.URL.includes("ItemMarket")) return
+    const list = getItemMarketList()
+    if (!list) return
+    ensureSortBar(list)
+
+    const children = Array.from(list.children)
+    const cells = children.filter((c) => getTileFromCell(c))
+
+    if (rwSortMode === "off") {
+        children.forEach((c) => (c.style.order = ""))
+        if (list.dataset.rwForcedFlex === "true") {
+            list.style.display = ""
+            list.style.flexDirection = ""
+            delete list.dataset.rwForcedFlex
+        }
+        return
+    }
+
+    // `order` only works on flex/grid children; a plain block list becomes a vertical flex column (looks the same)
+    const display = getComputedStyle(list).display
+    if (!display.includes("flex") && !display.includes("grid")) {
+        list.style.display = "flex"
+        list.style.flexDirection = "column"
+        list.dataset.rwForcedFlex = "true"
+    }
+
+    const [field, direction] = rwSortMode.split("-")
+    const dataKey = field === "quality" ? "rwQuality" : "rwValue"
+    const sign = direction === "asc" ? 1 : -1
+
+    const keyed = cells.map((cell, index) => {
+        const value = parseFloat(getTileFromCell(cell)?.dataset?.[dataKey])
+        return { cell, index, key: Number.isFinite(value) ? value : null }
+    })
+
+    // Listings without a readable bonus always sink to the bottom; ties keep Torn's original (price) order
+    keyed.sort((a, b) => {
+        if (a.key === null && b.key === null) return a.index - b.index
+        if (a.key === null) return 1
+        if (b.key === null) return -1
+        return (a.key - b.key) * sign || a.index - b.index
+    })
+
+    keyed.forEach(({ cell }, i) => (cell.style.order = String(i + 1)))
+
+    // Keep any non-listing children (loaders, scroll sentinels) at the end so infinite scroll still works
+    children.filter((c) => !cells.includes(c)).forEach((c) => (c.style.order = "999999"))
+}
+
+function scheduleItemMarketSort() {
+    clearTimeout(rwSortTimer)
+    rwSortTimer = setTimeout(applyItemMarketSort, 150)
 }
 
 function addItem(triggered) {
